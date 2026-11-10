@@ -123,20 +123,11 @@ def format_history(history):
 
 
 def chat_direct(query: str, history=None):
-    """Direct chat with Llama 3.2 with multi-turn memory."""
+    """Direct chat with Llama 3.2."""
     print(f"[*] Direct chat with Llama 3.2: '{query}'")
     llm = ChatOllama(model=LLM_MODEL, temperature=0.7)
     
-    history_text = format_history(history)
-    if history_text:
-        prompt = f"""You are a helpful, intelligent, and friendly AI assistant.
-Previous conversation history:
-{history_text}
-
-User: {query}
-Assistant:"""
-    else:
-        prompt = f"""You are a helpful, intelligent, and friendly AI assistant.
+    prompt = f"""You are a helpful, intelligent, and friendly AI assistant.
 Answer the following question clearly and concisely:
 
 {query}"""
@@ -149,13 +140,15 @@ Answer the following question clearly and concisely:
 
 
 def chat_rag(query: str, history=None):
-    """RAG mode: searches across uploaded documents with multi-turn memory."""
+    """RAG mode: searches across uploaded documents with general knowledge fallback."""
     vstore = get_vectorstore()
     total_vectors = vstore._collection.count()
 
     if total_vectors == 0:
+        print("[*] No documents in Chroma DB, falling back to direct LLM response...")
+        direct_res = chat_direct(query)
         return {
-            "answer": "No documents have been uploaded yet. Please upload a PDF in the sidebar to ask questions in RAG mode, or switch to Direct Chat mode.",
+            "answer": f"*(Note: No documents uploaded yet — answering from general knowledge)*\n\n" + direct_res["answer"],
             "sources": []
         }
 
@@ -178,23 +171,23 @@ def chat_rag(query: str, history=None):
         context_chunks.append(f"[{source_name} - Page {page_num}]\n{doc.page_content}")
 
     context_text = "\n\n---\n\n".join(context_chunks)
-    history_text = format_history(history)
-    history_section = f"CONVERSATION HISTORY:\n{history_text}\n\n" if history_text else ""
 
-    prompt = f"""You are an expert AI assistant answering questions based on the user's uploaded documents.
-Answer the question based STRICTLY and ONLY on the following retrieved context.
-If the context does not contain enough information to answer, state clearly: "The uploaded documents do not contain information to answer this question."
+    prompt = f"""You are a helpful AI assistant answering questions about uploaded documents.
 
-{history_section}CONTEXT:
+CONTEXT FROM UPLOADED DOCUMENTS:
 {context_text}
 
 QUESTION:
 {query}
 
+INSTRUCTIONS:
+- First, check the CONTEXT above. If the CONTEXT contains information related to the question, answer the question using the facts, details, and source citations from the CONTEXT.
+- Only if the CONTEXT has no information about the question at all, fall back to answering using your general knowledge, and mention that the topic was not found in the uploaded documents.
+
 ANSWER:"""
 
-    print("[*] Generating grounded response with Llama 3.2...")
-    llm = ChatOllama(model=LLM_MODEL, temperature=0)
+    print("[*] Generating response with Llama 3.2...")
+    llm = ChatOllama(model=LLM_MODEL, temperature=0.0)
     response = llm.invoke(prompt)
 
     return {
@@ -214,16 +207,7 @@ def stream_chat_direct(query: str, history=None):
     """Generator: streams tokens for direct chat mode."""
     llm = ChatOllama(model=LLM_MODEL, temperature=0.7)
 
-    history_text = format_history(history)
-    if history_text:
-        prompt = f"""You are a helpful, intelligent, and friendly AI assistant.
-Previous conversation history:
-{history_text}
-
-User: {query}
-Assistant:"""
-    else:
-        prompt = f"""You are a helpful, intelligent, and friendly AI assistant.
+    prompt = f"""You are a helpful, intelligent, and friendly AI assistant.
 Answer the following question clearly and concisely:
 
 {query}"""
@@ -238,14 +222,16 @@ Answer the following question clearly and concisely:
 
 
 def stream_chat_rag(query: str, history=None):
-    """Generator: retrieves context from Chroma, then streams tokens for RAG mode."""
+    """Generator: retrieves context from Chroma, then streams tokens for RAG mode with general knowledge fallback."""
     vstore = get_vectorstore()
     total_vectors = vstore._collection.count()
 
     if total_vectors == 0:
-        msg = "No documents have been uploaded yet. Please upload a PDF in the sidebar to ask questions in RAG mode, or switch to Direct Chat mode."
-        yield f"data: {json.dumps({'token': msg})}\n\n"
-        yield f"data: {json.dumps({'done': True, 'sources': []})}\n\n"
+        print("[*] No documents in Chroma DB, falling back to direct LLM stream...")
+        fallback_notice = json.dumps({"token": "*(Note: No documents uploaded yet — answering from general knowledge)*\n\n"})
+        yield f"data: {fallback_notice}\n\n"
+        for chunk in stream_chat_direct(query):
+            yield chunk
         return
 
     print(f"[*] Searching Chroma DB across {total_vectors} vectors for query: '{query}'")
@@ -267,22 +253,22 @@ def stream_chat_rag(query: str, history=None):
         context_chunks.append(f"[{source_name} - Page {page_num}]\n{doc.page_content}")
 
     context_text = "\n\n---\n\n".join(context_chunks)
-    history_text = format_history(history)
-    history_section = f"CONVERSATION HISTORY:\n{history_text}\n\n" if history_text else ""
 
-    prompt = f"""You are an expert AI assistant answering questions based on the user's uploaded documents.
-Answer the question based STRICTLY and ONLY on the following retrieved context.
-If the context does not contain enough information to answer, state clearly: "The uploaded documents do not contain information to answer this question."
+    prompt = f"""You are a helpful AI assistant answering questions about uploaded documents.
 
-{history_section}CONTEXT:
+CONTEXT FROM UPLOADED DOCUMENTS:
 {context_text}
 
 QUESTION:
 {query}
 
+INSTRUCTIONS:
+- First, check the CONTEXT above. If the CONTEXT contains information related to the question, answer the question using the facts, details, and source citations from the CONTEXT.
+- Only if the CONTEXT has no information about the question at all, fall back to answering using your general knowledge, and mention that the topic was not found in the uploaded documents.
+
 ANSWER:"""
 
-    llm = ChatOllama(model=LLM_MODEL, temperature=0)
+    llm = ChatOllama(model=LLM_MODEL, temperature=0.0)
     for chunk in llm.stream(prompt):
         token = chunk.content
         if token:

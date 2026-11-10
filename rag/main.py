@@ -184,18 +184,15 @@ def handle_chat(request: ChatRequest):
             title = (user_query[:35] + "...") if len(user_query) > 35 else user_query
             db.update_thread_title(thread_id, title)
 
-    # 1. Fetch prior conversation history for context memory
-    history = db.get_thread_messages(thread_id)
-
-    # 2. Record user's message in SQLite
+    # 1. Record user's message in SQLite
     db.add_message(thread_id, "user", user_query)
 
     try:
-        # 3. Generate response with multi-turn history
+        # 2. Generate response
         if request.mode == "chat":
-            result = chat_direct(user_query, history=history)
+            result = chat_direct(user_query)
         else:
-            result = chat_rag(user_query, history=history)
+            result = chat_rag(user_query)
 
         answer = result["answer"]
         sources = result.get("sources", [])
@@ -243,7 +240,6 @@ async def handle_chat_stream(request: ChatRequest):
             title = (user_query[:35] + "...") if len(user_query) > 35 else user_query
             db.update_thread_title(thread_id, title)
 
-    history = db.get_thread_messages(thread_id)
     db.add_message(thread_id, "user", user_query)
 
     import json
@@ -254,9 +250,9 @@ async def handle_chat_stream(request: ChatRequest):
 
         try:
             gen = (
-                stream_chat_direct(user_query, history=history)
+                stream_chat_direct(user_query)
                 if request.mode == "chat"
-                else stream_chat_rag(user_query, history=history)
+                else stream_chat_rag(user_query)
             )
 
             for event in gen:
