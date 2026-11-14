@@ -16,9 +16,10 @@ env/
 .venv/
 .env/
 
-# ── Chroma DB & uploads (auto-generated, not for VCS) ────────────────────────
+# ── Chroma DB & uploaded documents (local user data, not for VCS) ───────────
 rag/chroma_db/
-rag/docs/*.pdf
+rag/docs/*
+!rag/docs/.gitkeep
 
 # SQLite chat history (local data)
 rag/*.db
