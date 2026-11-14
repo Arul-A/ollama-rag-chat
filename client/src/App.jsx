@@ -46,20 +46,11 @@ export default function App() {
 
   const fetchData = async () => {
     try {
-      const [docRes, threadRes] = await Promise.all([
-        fetch(`${BACKEND_URL}/api/documents`),
-        fetch(`${BACKEND_URL}/api/threads`),
-      ]);
-
-      if (docRes.ok) {
-        const docData = await docRes.json();
-        setDocuments(docData.documents || []);
-      }
+      const threadRes = await fetch(`${BACKEND_URL}/api/threads`);
       if (threadRes.ok) {
         const threadData = await threadRes.json();
         setThreads(threadData.threads || []);
       }
-
       setServerOnline(true);
     } catch {
       setServerOnline(false);
@@ -70,7 +61,7 @@ export default function App() {
     fetchData();
   }, []);
 
-  // ── Thread management ───────────────────────────────────────────────────────
+  // ── Thread & Mode management ────────────────────────────────────────────────
 
   const handleSelectThread = async (thread) => {
     setActiveThreadId(thread.id);
@@ -78,26 +69,43 @@ export default function App() {
     setLoading(true);
 
     try {
-      const res = await fetch(`${BACKEND_URL}/api/threads/${thread.id}/messages`);
-      if (res.ok) {
-        const data = await res.json();
+      const [msgRes, docRes] = await Promise.all([
+        fetch(`${BACKEND_URL}/api/threads/${thread.id}/messages`),
+        fetch(`${BACKEND_URL}/api/documents?thread_id=${thread.id}`),
+      ]);
+
+      if (msgRes.ok) {
+        const data = await msgRes.json();
         setMessages(data.messages || []);
       }
+      if (docRes.ok) {
+        const docData = await docRes.json();
+        setDocuments(docData.documents || []);
+      } else {
+        setDocuments([]);
+      }
     } catch (err) {
-      console.error("Failed to load thread messages:", err);
+      console.error("Failed to load thread details:", err);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleNewChat = () => {
+  const handleNewChat = (forcedMode) => {
     setActiveThreadId(null);
     setMessages([]);
+    setDocuments([]);
+    if (forcedMode) setMode(forcedMode);
+  };
+
+  const handleSwitchMode = (newMode) => {
+    if (newMode === mode) return;
+    handleNewChat(newMode);
   };
 
   const handleDeleteThread = async (e, threadId) => {
     e.stopPropagation();
-    if (!window.confirm("Delete this conversation history?")) return;
+    if (!window.confirm("Delete this conversation history and its attached files?")) return;
 
     try {
       const res = await fetch(`${BACKEND_URL}/api/threads/${threadId}`, {
@@ -113,20 +121,26 @@ export default function App() {
     }
   };
 
-  // ── Document management ─────────────────────────────────────────────────────
+  // ── Document management (Thread-scoped) ──────────────────────────────────────
 
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      alert("Please upload a PDF file.");
+    const allowed = [".pdf", ".txt", ".md", ".docx", ".csv"];
+    const ext = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+    if (!allowed.includes(ext)) {
+      alert("Please upload a supported file (.pdf, .txt, .md, .docx, .csv).");
       return;
     }
 
+    setMode("rag");
     setUploading(true);
     const formData = new FormData();
     formData.append("file", file);
+    if (activeThreadId) {
+      formData.append("thread_id", activeThreadId);
+    }
 
     try {
       const res = await fetch(`${BACKEND_URL}/api/upload`, {
@@ -137,14 +151,28 @@ export default function App() {
       if (!res.ok) throw new Error("Upload failed");
       const data = await res.json();
 
+      // If a new thread was created on upload, set it active
+      if (data.thread_id && data.thread_id !== activeThreadId) {
+        setActiveThreadId(data.thread_id);
+      }
+
       setDocuments(data.documents || []);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: `✅ Document **${data.filename}** indexed into Chroma DB (${data.pages} pages, ${data.chunks} chunks). You can now ask questions about it!`,
-        },
-      ]);
+
+      // Reload thread messages to include attachment notice
+      if (data.thread_id) {
+        const msgRes = await fetch(`${BACKEND_URL}/api/threads/${data.thread_id}/messages`);
+        if (msgRes.ok) {
+          const msgData = await msgRes.json();
+          setMessages(msgData.messages || []);
+        }
+      }
+
+      // Refresh threads list in sidebar
+      const threadRes = await fetch(`${BACKEND_URL}/api/threads`);
+      if (threadRes.ok) {
+        const threadData = await threadRes.json();
+        setThreads(threadData.threads || []);
+      }
     } catch (err) {
       console.error(err);
       alert("Error uploading file. Make sure your FastAPI server is running on port 8000.");
@@ -155,13 +183,14 @@ export default function App() {
   };
 
   const handleDeleteDocument = async (filename) => {
-    if (!window.confirm(`Delete "${filename}" and remove its vectors from Chroma DB?`)) return;
+    if (!window.confirm(`Remove "${filename}" from this chat?`)) return;
 
     try {
-      const res = await fetch(`${BACKEND_URL}/api/documents/${encodeURIComponent(filename)}`, {
-        method: "DELETE",
-      });
+      const url = activeThreadId
+        ? `${BACKEND_URL}/api/documents/${encodeURIComponent(filename)}?thread_id=${activeThreadId}`
+        : `${BACKEND_URL}/api/documents/${encodeURIComponent(filename)}`;
 
+      const res = await fetch(url, { method: "DELETE" });
       if (!res.ok) throw new Error("Delete failed");
       const data = await res.json();
 
@@ -170,7 +199,7 @@ export default function App() {
         ...prev,
         {
           role: "assistant",
-          content: `🗑️ Document **${filename}** and its vectors were removed from Chroma DB.`,
+          content: `🗑️ Removed document **${filename}** from this chat.`,
         },
       ]);
     } catch (err) {
@@ -288,14 +317,10 @@ export default function App() {
         showSidebar={showSidebar}
         threads={threads}
         activeThreadId={activeThreadId}
-        documents={documents}
-        uploading={uploading}
         serverOnline={serverOnline}
-        fileInputRef={fileInputRef}
-        onNewChat={handleNewChat}
+        onNewChat={() => handleNewChat()}
         onSelectThread={handleSelectThread}
         onDeleteThread={handleDeleteThread}
-        onDeleteDocument={handleDeleteDocument}
       />
 
       {/* ── Main Chat Container ── */}
@@ -317,7 +342,7 @@ export default function App() {
             {/* Mode Switcher */}
             <div className="flex items-center bg-zinc-800/90 p-1 rounded-xl border border-zinc-700/60">
               <button
-                onClick={() => setMode("chat")}
+                onClick={() => handleSwitchMode("chat")}
                 className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium transition ${
                   mode === "chat"
                     ? "bg-zinc-700 text-zinc-100 shadow-sm"
@@ -328,7 +353,7 @@ export default function App() {
                 <span>Direct Chat</span>
               </button>
               <button
-                onClick={() => setMode("rag")}
+                onClick={() => handleSwitchMode("rag")}
                 className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium transition ${
                   mode === "rag"
                     ? "bg-emerald-700/80 text-emerald-100 shadow-sm"
@@ -337,13 +362,32 @@ export default function App() {
               >
                 <span>📄</span>
                 <span>RAG Mode</span>
-                {documents.length > 0 && (
-                  <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-emerald-900 text-emerald-300 font-mono">
-                    {documents.length}
-                  </span>
-                )}
               </button>
             </div>
+
+            {/* Attached Document Pill (in RAG mode) */}
+            {mode === "rag" && documents.length > 0 && (
+              <div className="flex items-center gap-1.5 px-2.5 py-1 bg-emerald-950/60 border border-emerald-800/40 rounded-xl text-xs text-emerald-300">
+                <span>📎</span>
+                <span className="font-medium truncate max-w-[150px]" title={documents.map((d) => d.filename).join(", ")}>
+                  {documents[0].filename}
+                </span>
+                {documents.length > 1 && (
+                  <span className="text-[10px] bg-emerald-900/80 px-1.5 py-0.5 rounded-full text-emerald-200">
+                    +{documents.length - 1}
+                  </span>
+                )}
+                <button
+                  onClick={() => handleDeleteDocument(documents[0].filename)}
+                  className="ml-1 text-emerald-500 hover:text-rose-400 transition"
+                  title="Remove document from this chat"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="text-xs text-zinc-400 hidden sm:flex items-center gap-2">
@@ -361,15 +405,44 @@ export default function App() {
                 <span className="text-2xl">{mode === "chat" ? "💬" : "📄"}</span>
               </div>
               <h1 className="text-2xl font-semibold text-zinc-100 mb-2">
-                {mode === "chat" ? "Direct Chat with Llama 3.2" : "Multi-Document Knowledge Base"}
+                {mode === "chat" ? "Direct Chat with Llama 3.2" : "Document Q&A (RAG)"}
               </h1>
-              <p className="text-sm text-zinc-400 mb-8 max-w-md">
+              <p className="text-sm text-zinc-400 mb-6 max-w-md">
                 {mode === "chat"
                   ? "Chat freely with the local model. All messages are stored in your local SQLite database."
                   : documents.length > 0
-                  ? `Search across your ${documents.length} document(s) with grounded citations and chat history.`
-                  : "Upload PDF documents in the sidebar to ask questions in RAG Mode."}
+                  ? `Chatting with ${documents[0].filename}${documents.length > 1 ? ` (+${documents.length - 1} more)` : ""}.`
+                  : "Attach a document to this chat to ask questions with exact citations."}
               </p>
+
+              {/* RAG Mode: Prompt to attach document if none attached */}
+              {mode === "rag" && documents.length === 0 && (
+                <div
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-full max-w-md p-5 border-2 border-dashed border-zinc-700 hover:border-emerald-500/60 rounded-2xl bg-zinc-800/30 hover:bg-zinc-800/60 cursor-pointer transition flex flex-col items-center justify-center gap-2.5 mb-6 group shadow-sm"
+                >
+                  <div className="w-10 h-10 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center justify-center group-hover:scale-110 transition">
+                    {uploading ? (
+                      <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                      </svg>
+                    ) : (
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                      </svg>
+                    )}
+                  </div>
+                  <div className="text-center">
+                    <div className="text-xs font-medium text-zinc-200 group-hover:text-emerald-300 transition">
+                      {uploading ? "Indexing document..." : "Click to attach a document to this chat"}
+                    </div>
+                    <div className="text-[11px] text-zinc-500 mt-0.5">
+                      Supports PDF, TXT, Markdown, DOCX, CSV
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Starter Prompt Cards */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 w-full">
@@ -469,14 +542,28 @@ export default function App() {
             <div className="relative flex items-center bg-[#2f2f2f] rounded-2xl border border-zinc-700/80 shadow-lg px-3 py-2">
               {/* Attach / upload button */}
               <button
-                onClick={() => fileInputRef.current?.click()}
+                onClick={() => {
+                  if (mode === "chat") setMode("rag");
+                  fileInputRef.current?.click();
+                }}
                 disabled={uploading}
-                className="p-2 text-zinc-400 hover:text-zinc-200 rounded-lg hover:bg-zinc-700/50 transition mr-1"
-                title="Upload Document"
+                className={`p-2 rounded-lg transition mr-1 ${
+                  mode === "rag" && documents.length > 0
+                    ? "text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20"
+                    : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/50"
+                }`}
+                title={mode === "chat" ? "Attach document (switches to RAG Mode)" : "Attach document to this chat"}
               >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
-                </svg>
+                {uploading ? (
+                  <svg className="w-5 h-5 animate-spin text-emerald-400" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                  </svg>
+                ) : (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                  </svg>
+                )}
               </button>
 
               <input
@@ -485,11 +572,13 @@ export default function App() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
                 placeholder={
-                  mode === "chat"
+                  uploading
+                    ? "Indexing document into this chat..."
+                    : mode === "chat"
                     ? "Message Llama 3.2 directly..."
                     : documents.length > 0
-                    ? "Ask anything across your uploaded documents..."
-                    : "Upload a PDF in the sidebar to ask questions in RAG Mode..."
+                    ? `Ask about ${documents[0].filename}...`
+                    : "Attach a document using 📎 or ask a question..."
                 }
                 disabled={loading}
                 className="flex-1 bg-transparent text-sm text-zinc-100 placeholder-zinc-400 focus:outline-none px-2 py-1"
@@ -513,18 +602,20 @@ export default function App() {
             <div className="text-center mt-2 text-[11px] text-zinc-400">
               {mode === "chat"
                 ? "Direct Chat Mode: Instant responses saved locally in SQLite."
-                : `RAG Mode: Grounded in ${documents.length} document(s) with multi-turn memory.`}
+                : documents.length > 0
+                ? `RAG Mode: Scoped to ${documents[0].filename}${documents.length > 1 ? ` (+${documents.length - 1} more)` : ""}.`
+                : "RAG Mode: Attach a document below to scope this chat's knowledge base."}
             </div>
           </div>
         </div>
       </main>
 
-      {/* Hidden file input (also used by the input bar's attach button) */}
+      {/* Hidden file input (used by sidebar and input bar's attach button) */}
       <input
         type="file"
         ref={fileInputRef}
         onChange={handleFileUpload}
-        accept=".pdf"
+        accept=".pdf,.txt,.md,.docx,.csv"
         className="hidden"
       />
     </div>

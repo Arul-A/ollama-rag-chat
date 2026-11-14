@@ -2,7 +2,7 @@ import os
 import shutil
 import uuid
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -11,9 +11,11 @@ import uvicorn
 import db
 from rag_service import (
     DOCS_DIR,
+    SUPPORTED_EXTENSIONS,
     list_documents,
     add_document,
     delete_document,
+    delete_thread_documents,
     chat_direct,
     chat_rag,
     stream_chat_direct,
@@ -97,31 +99,51 @@ def get_messages(thread_id: str):
 
 @app.delete("/api/threads/{thread_id}")
 def remove_thread(thread_id: str):
-    """Deletes a conversation thread and its message history."""
+    """Deletes a conversation thread, its message history, and associated vectors."""
+    delete_thread_documents(thread_id)
     db.delete_thread(thread_id)
     return {
         "status": "success",
-        "message": f"Thread '{thread_id}' deleted.",
+        "message": f"Thread '{thread_id}' and its vectors deleted.",
         "threads": db.get_all_threads()
     }
 
 
 # ==============================================================================
-# DOCUMENT MANAGEMENT ENDPOINTS (Chroma DB)
+# DOCUMENT MANAGEMENT ENDPOINTS (Chroma DB - Thread-Scoped)
 # ==============================================================================
 
 @app.get("/api/documents")
-def get_documents():
+def get_documents(thread_id: Optional[str] = None):
     return {
         "status": "success",
-        "documents": list_documents()
+        "documents": list_documents(thread_id=thread_id)
     }
 
 
 @app.post("/api/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+async def upload_document(
+    file: UploadFile = File(...),
+    thread_id: Optional[str] = Form(None)
+):
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        supported_str = ", ".join(SUPPORTED_EXTENSIONS.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '{ext}'. Supported formats: {supported_str}"
+        )
+
+    # If no thread_id provided, create a new thread for this document
+    if not thread_id:
+        thread_id = str(uuid.uuid4())
+        title = f"Doc: {file.filename[:30]}"
+        db.create_thread(thread_id, title, "rag")
+    else:
+        # If thread exists with 0 messages, name it after the document
+        existing_msgs = db.get_thread_messages(thread_id)
+        if len(existing_msgs) == 0:
+            db.update_thread_title(thread_id, f"Doc: {file.filename[:30]}")
 
     os.makedirs(DOCS_DIR, exist_ok=True)
     save_path = os.path.join(DOCS_DIR, file.filename)
@@ -130,29 +152,37 @@ async def upload_pdf(file: UploadFile = File(...)):
         with open(save_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        pages, chunks = add_document(save_path, file.filename)
+        pages, chunks = add_document(save_path, file.filename, thread_id=thread_id)
+
+        # Record attachment notification in chat thread
+        db.add_message(
+            thread_id,
+            "assistant",
+            f"📎 Attached **{file.filename}** ({pages} pages, {chunks} chunks). You can now ask questions about this document!"
+        )
 
         return {
             "status": "success",
-            "message": f"'{file.filename}' uploaded and indexed.",
+            "message": f"'{file.filename}' uploaded and indexed for this chat.",
             "filename": file.filename,
             "pages": pages,
             "chunks": chunks,
-            "documents": list_documents()
+            "thread_id": thread_id,
+            "documents": list_documents(thread_id=thread_id)
         }
     except Exception as e:
         print(f"[ERROR] Upload failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
 
 
 @app.delete("/api/documents/{filename}")
-def remove_document(filename: str):
+def remove_document(filename: str, thread_id: Optional[str] = None):
     try:
-        delete_document(filename)
+        delete_document(filename, thread_id=thread_id)
         return {
             "status": "success",
             "message": f"Document '{filename}' and its vectors were removed.",
-            "documents": list_documents()
+            "documents": list_documents(thread_id=thread_id)
         }
     except Exception as e:
         print(f"[ERROR] Delete failed: {str(e)}")
@@ -174,11 +204,9 @@ def handle_chat(request: ChatRequest):
     # If no thread_id provided, create a new thread with a title from the first question
     if not thread_id:
         thread_id = str(uuid.uuid4())
-        # Truncate title to first 35 chars
         title = (user_query[:35] + "...") if len(user_query) > 35 else user_query
         db.create_thread(thread_id, title, request.mode)
     else:
-        # Check if existing thread has default title and rename based on user query
         existing_msgs = db.get_thread_messages(thread_id)
         if len(existing_msgs) == 0:
             title = (user_query[:35] + "...") if len(user_query) > 35 else user_query
@@ -188,16 +216,16 @@ def handle_chat(request: ChatRequest):
     db.add_message(thread_id, "user", user_query)
 
     try:
-        # 2. Generate response
+        # 2. Generate response (scoped by thread_id)
         if request.mode == "chat":
             result = chat_direct(user_query)
         else:
-            result = chat_rag(user_query)
+            result = chat_rag(user_query, thread_id=thread_id)
 
         answer = result["answer"]
         sources = result.get("sources", [])
 
-        # 4. Record assistant's response and citations in SQLite
+        # 3. Record assistant's response and citations in SQLite
         db.add_message(thread_id, "assistant", answer, sources=sources)
 
         return {
@@ -252,7 +280,7 @@ async def handle_chat_stream(request: ChatRequest):
             gen = (
                 stream_chat_direct(user_query)
                 if request.mode == "chat"
-                else stream_chat_rag(user_query)
+                else stream_chat_rag(user_query, thread_id=thread_id)
             )
 
             for event in gen:

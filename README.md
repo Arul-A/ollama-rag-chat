@@ -9,7 +9,7 @@ Run large language models and vector document search completely on your own mach
 ## ✨ Features
 
 - **💬 Direct Chat Mode**: Converse directly with local LLMs (e.g., Llama 3.2, DeepSeek-R1, Mistral, Qwen) with zero document restrictions.
-- **📄 Multi-Document RAG Mode**: Upload multiple PDF documents into a persistent vector knowledge base. Ask questions and receive grounded answers with exact **Filename + Page number** citations.
+- **📄 Multi-Document RAG Mode**: Upload multiple documents (PDF, TXT, Markdown, Word DOCX, and CSV) into a persistent vector knowledge base. Ask questions and receive grounded answers with exact **Filename + Page/Section** citations.
 - **💾 Local SQLite Chat History & Multi-Turn Memory**: All conversations are stored in a local SQLite database (`chat_history.db`). Browse past chat threads in the sidebar, switch conversations, and enjoy conversational memory across turns.
 - **🗑️ Dynamic Vector Deletion**: Delete documents directly from the UI. Only the vector embeddings for that specific document are removed from Chroma DB without corrupting or resetting the database.
 - **🎨 Modern ChatGPT Dark Theme**: Clean interface built with React and Tailwind CSS featuring starter prompts, expandable citations, and live backend connection indicators.

@@ -1,6 +1,11 @@
 import os
 import json
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    Docx2txtLoader,
+    CSVLoader
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_community.vectorstores import Chroma
@@ -32,14 +37,43 @@ def get_vectorstore():
     return _vectorstore
 
 
-def list_documents():
-    """Returns a list of all distinct documents and their chunk counts in Chroma DB."""
+SUPPORTED_EXTENSIONS = {
+    ".pdf": "PDF",
+    ".txt": "Text",
+    ".md": "Markdown",
+    ".docx": "Word Document",
+    ".csv": "CSV"
+}
+
+
+def get_loader(file_path: str, filename: str):
+    """Selects the appropriate LangChain document loader based on file extension."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".pdf":
+        return PyPDFLoader(file_path)
+    elif ext in [".txt", ".md"]:
+        return TextLoader(file_path, encoding="utf-8")
+    elif ext == ".docx":
+        return Docx2txtLoader(file_path)
+    elif ext == ".csv":
+        return CSVLoader(file_path, encoding="utf-8")
+    else:
+        supported = ", ".join(SUPPORTED_EXTENSIONS.keys())
+        raise ValueError(f"Unsupported file format '{ext}'. Supported formats: {supported}")
+
+
+def list_documents(thread_id: str = None):
+    """Returns a list of all distinct documents and their chunk counts in Chroma DB, optionally filtered by thread_id."""
     vstore = get_vectorstore()
     count = vstore._collection.count()
     if count == 0:
         return []
 
-    data = vstore._collection.get(include=["metadatas"])
+    if thread_id:
+        data = vstore._collection.get(where={"thread_id": thread_id}, include=["metadatas"])
+    else:
+        data = vstore._collection.get(include=["metadatas"])
+
     metadatas = data.get("metadatas", [])
 
     summary = {}
@@ -47,13 +81,15 @@ def list_documents():
         if not meta:
             continue
         source = meta.get("source", "Unknown")
-        page = meta.get("page", 0)
+        raw_page = meta.get("page")
+        page = raw_page if isinstance(raw_page, int) else 0
 
         if source not in summary:
             summary[source] = {
                 "filename": source,
                 "chunks": 0,
-                "pages": 0
+                "pages": 0,
+                "thread_id": meta.get("thread_id")
             }
         summary[source]["chunks"] += 1
         summary[source]["pages"] = max(summary[source]["pages"], page + 1)
@@ -61,15 +97,15 @@ def list_documents():
     return list(summary.values())
 
 
-def add_document(file_path: str, filename: str):
+def add_document(file_path: str, filename: str, thread_id: str = None):
     """
-    Chunks a new PDF, tags every chunk with the filename in metadata,
+    Chunks a new document (PDF, TXT, MD, DOCX, CSV), tags every chunk with the filename and thread_id in metadata,
     and appends the vectors into Chroma DB.
     """
     vstore = get_vectorstore()
 
-    print(f"\n[*] Processing document: {filename}")
-    loader = PyPDFLoader(file_path)
+    print(f"\n[*] Processing document: {filename} (Thread: {thread_id})")
+    loader = get_loader(file_path, filename)
     pages = loader.load()
 
     text_splitter = RecursiveCharacterTextSplitter(
@@ -79,35 +115,70 @@ def add_document(file_path: str, filename: str):
     )
     chunks = text_splitter.split_documents(pages)
 
-    # Ensure metadata has the exact clean filename
+    # Ensure metadata has the exact clean filename, thread_id, and a default page/section number
     for chunk in chunks:
         chunk.metadata["source"] = filename
+        if thread_id:
+            chunk.metadata["thread_id"] = thread_id
+        if "page" not in chunk.metadata or chunk.metadata["page"] is None:
+            chunk.metadata["page"] = 0
 
     print(f"[*] Embedding and adding {len(chunks)} chunks to Chroma DB...")
     vstore.add_documents(chunks)
-    print(f"[✓] Added '{filename}' successfully!")
+    print(f"[✓] Added '{filename}' successfully to thread '{thread_id}'!")
 
     return len(pages), len(chunks)
 
 
-def delete_document(filename: str):
+def delete_document(filename: str, thread_id: str = None):
     """
-    Deletes all vectors belonging to a specific document from Chroma DB
-    and removes the file from the docs folder.
+    Deletes all vectors belonging to a specific document (and thread if provided) from Chroma DB
+    and removes the file from the docs folder if no other thread uses it.
     """
     vstore = get_vectorstore()
 
-    print(f"[*] Deleting vectors for: '{filename}' from Chroma DB...")
-    vstore._collection.delete(where={"source": filename})
+    print(f"[*] Deleting vectors for: '{filename}' from Chroma DB (thread={thread_id})...")
+    if thread_id:
+        vstore._collection.delete(where={"$and": [{"source": filename}, {"thread_id": thread_id}]})
+    else:
+        vstore._collection.delete(where={"source": filename})
 
-    # Delete physical file
-    target_file = os.path.join(DOCS_DIR, filename)
-    if os.path.exists(target_file):
-        os.remove(target_file)
-        print(f"[✓] Removed file from disk: {target_file}")
+    # Delete physical file if no other thread references it
+    remaining = vstore._collection.get(where={"source": filename}, include=["metadatas"])
+    if not remaining.get("metadatas"):
+        target_file = os.path.join(DOCS_DIR, filename)
+        if os.path.exists(target_file):
+            os.remove(target_file)
+            print(f"[✓] Removed file from disk: {target_file}")
 
     print(f"[✓] Document '{filename}' deleted from knowledge base.")
     return True
+
+
+def delete_thread_documents(thread_id: str):
+    """Deletes all vectors associated with a specific thread from Chroma DB."""
+    if not thread_id:
+        return
+    vstore = get_vectorstore()
+    try:
+        print(f"[*] Deleting all vectors for thread: '{thread_id}' from Chroma DB...")
+        # Check files referenced
+        data = vstore._collection.get(where={"thread_id": thread_id}, include=["metadatas"])
+        metadatas = data.get("metadatas", [])
+        sources = {m.get("source") for m in metadatas if m and m.get("source")}
+
+        vstore._collection.delete(where={"thread_id": thread_id})
+
+        # Remove physical files if not used by any other thread
+        for src in sources:
+            remaining = vstore._collection.get(where={"source": src}, include=["metadatas"])
+            if not remaining.get("metadatas"):
+                target_file = os.path.join(DOCS_DIR, src)
+                if os.path.exists(target_file):
+                    os.remove(target_file)
+                    print(f"[✓] Removed file from disk: {target_file}")
+    except Exception as e:
+        print(f"[!] Note on thread vector cleanup: {e}")
 
 
 def format_history(history):
@@ -139,27 +210,35 @@ Answer the following question clearly and concisely:
     }
 
 
-def chat_rag(query: str, history=None):
-    """RAG mode: searches across uploaded documents with general knowledge fallback."""
+def chat_rag(query: str, thread_id: str = None, history=None):
+    """RAG mode: searches across uploaded documents for the active thread with general knowledge fallback."""
     vstore = get_vectorstore()
-    total_vectors = vstore._collection.count()
+
+    # Determine vector count for this thread (or globally if no thread_id)
+    if thread_id:
+        existing = vstore._collection.get(where={"thread_id": thread_id}, include=["metadatas"])
+        total_vectors = len(existing.get("ids", []))
+    else:
+        total_vectors = vstore._collection.count()
 
     if total_vectors == 0:
-        print("[*] No documents in Chroma DB, falling back to direct LLM response...")
+        print(f"[*] No documents attached to thread {thread_id}, falling back to direct LLM response...")
         direct_res = chat_direct(query)
         return {
-            "answer": f"*(Note: No documents uploaded yet — answering from general knowledge)*\n\n" + direct_res["answer"],
+            "answer": f"*(Note: No document attached to this chat — answering from general knowledge)*\n\n" + direct_res["answer"],
             "sources": []
         }
 
-    print(f"[*] Searching Chroma DB across {total_vectors} vectors for query: '{query}'")
-    results = vstore.similarity_search_with_score(query, k=4)
+    print(f"[*] Searching Chroma DB across {total_vectors} vectors for query: '{query}' (thread: {thread_id})")
+    search_filter = {"thread_id": thread_id} if thread_id else None
+    results = vstore.similarity_search_with_score(query, k=4, filter=search_filter)
 
     sources = []
     context_chunks = []
     for doc, score in results:
         source_name = doc.metadata.get("source", "Document")
-        page_num = doc.metadata.get("page", 0) + 1
+        raw_page = doc.metadata.get("page")
+        page_num = (raw_page if isinstance(raw_page, int) else 0) + 1
         snippet = doc.page_content.strip().replace("\n", " ")[:200]
 
         sources.append({
@@ -221,27 +300,35 @@ Answer the following question clearly and concisely:
     yield f"data: {json.dumps({'done': True, 'sources': []})}\n\n"
 
 
-def stream_chat_rag(query: str, history=None):
-    """Generator: retrieves context from Chroma, then streams tokens for RAG mode with general knowledge fallback."""
+def stream_chat_rag(query: str, thread_id: str = None, history=None):
+    """Generator: retrieves context from Chroma for the active thread, then streams tokens for RAG mode."""
     vstore = get_vectorstore()
-    total_vectors = vstore._collection.count()
+
+    # Determine vector count for this thread (or globally if no thread_id)
+    if thread_id:
+        existing = vstore._collection.get(where={"thread_id": thread_id}, include=["metadatas"])
+        total_vectors = len(existing.get("ids", []))
+    else:
+        total_vectors = vstore._collection.count()
 
     if total_vectors == 0:
-        print("[*] No documents in Chroma DB, falling back to direct LLM stream...")
-        fallback_notice = json.dumps({"token": "*(Note: No documents uploaded yet — answering from general knowledge)*\n\n"})
+        print(f"[*] No documents attached to thread {thread_id}, falling back to direct LLM stream...")
+        fallback_notice = json.dumps({"token": "*(Note: No document attached to this chat — answering from general knowledge)*\n\n"})
         yield f"data: {fallback_notice}\n\n"
         for chunk in stream_chat_direct(query):
             yield chunk
         return
 
-    print(f"[*] Searching Chroma DB across {total_vectors} vectors for query: '{query}'")
-    results = vstore.similarity_search_with_score(query, k=4)
+    print(f"[*] Searching Chroma DB across {total_vectors} vectors for query: '{query}' (thread: {thread_id})")
+    search_filter = {"thread_id": thread_id} if thread_id else None
+    results = vstore.similarity_search_with_score(query, k=4, filter=search_filter)
 
     sources = []
     context_chunks = []
     for doc, score in results:
         source_name = doc.metadata.get("source", "Document")
-        page_num = doc.metadata.get("page", 0) + 1
+        raw_page = doc.metadata.get("page")
+        page_num = (raw_page if isinstance(raw_page, int) else 0) + 1
         snippet = doc.page_content.strip().replace("\n", " ")[:200]
 
         sources.append({
